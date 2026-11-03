@@ -1,0 +1,204 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# GitLab CI definition for the quality gate.
+#
+# Every job runs tools/install-deps.sh and then the same CMake presets that
+# tools/check.sh uses locally, so CI and local runs apply the same checks.
+#
+# Self-hosted runners usually have the toolchain built into a custom image.
+# In that case drop the before_script and set DEPS_PREINSTALLED=1.
+
+default:
+  image: ubuntu:24.04
+  interruptible: true
+  before_script:
+    - |
+      if [ "${DEPS_PREINSTALLED:-0}" != "1" ]; then
+        ./tools/install-deps.sh
+      fi
+
+# Run merge request pipelines while an MR is open and branch pipelines
+# otherwise, so a push does not start two pipelines.
+workflow:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH && $CI_OPEN_MERGE_REQUESTS
+      when: never
+    - if: $CI_COMMIT_BRANCH
+
+variables:
+  DEMO_BUG: "0"
+  GIT_DEPTH: "20"
+  FUZZ_SECONDS: "60"
+
+# Stages only group jobs in the UI. The needs: lists set the actual order, so
+# each job starts as soon as the jobs it depends on have finished.
+stages:
+  - build
+  - analyze
+  - test
+  - fuzz
+  - verify-gate
+
+# ---------------------------------------------------------------------------
+# Stage 1: compiler warnings as errors. Every other job depends on a clean
+# build, so this one runs first.
+# ---------------------------------------------------------------------------
+warnings:
+  stage: build
+  script:
+    - cmake --preset default -DDEMO_BUG=$DEMO_BUG
+    - cmake --build --preset default
+  artifacts:
+    expire_in: 1 week
+    paths:
+      - build/compile_commands.json
+
+# ---------------------------------------------------------------------------
+# Stage 2: three static analyzers in parallel. Each one finds bugs the
+# others miss.
+# ---------------------------------------------------------------------------
+cppcheck:
+  stage: analyze
+  needs: [warnings]
+  script:
+    - |
+      cppcheck --enable=all --inline-suppr --std=c11 --error-exitcode=2 \
+        --suppressions-list=.cppcheck-suppressions \
+        --xml --output-file=cppcheck.xml \
+        -Iinclude -DDEMO_BUG=$DEMO_BUG src/
+  artifacts:
+    when: always
+    expire_in: 1 week
+    paths:
+      - cppcheck.xml
+
+clang-tidy:
+  stage: analyze
+  needs: [warnings]
+  script:
+    - cmake --preset tidy -DDEMO_BUG=$DEMO_BUG
+    - cmake --build --preset tidy
+
+gcc-analyzer:
+  stage: analyze
+  needs: [warnings]
+  script:
+    - cmake --preset analyzer -DDEMO_BUG=$DEMO_BUG
+    - cmake --build --preset analyzer
+
+# ---------------------------------------------------------------------------
+# Stage 3: unit tests, plus the same tests under sanitizers. A sanitizer
+# build changes timing and code generation, so the uninstrumented run shows
+# whether a failure is a logic bug or a sanitizer finding.
+# ---------------------------------------------------------------------------
+unit-tests:
+  stage: test
+  needs: [warnings]
+  script:
+    - cmake --preset default -DDEMO_BUG=$DEMO_BUG
+    - cmake --build --preset default
+    - ctest --preset default --output-junit test-results.xml
+  artifacts:
+    when: always
+    expire_in: 1 week
+    reports:
+      junit: build/test-results.xml
+
+sanitizers:
+  stage: test
+  needs: [warnings]
+  script:
+    - cmake --preset sanitize -DDEMO_BUG=$DEMO_BUG
+    - cmake --build --preset sanitize
+    # UBSAN_OPTIONS and ASAN_OPTIONS come from the sanitize test preset.
+    - ctest --preset sanitize --output-junit test-results.xml
+  artifacts:
+    when: always
+    expire_in: 1 week
+    reports:
+      junit: build-sanitize/test-results.xml
+
+coverage:
+  stage: test
+  needs: [warnings]
+  script:
+    - cmake --preset coverage -DDEMO_BUG=$DEMO_BUG
+    - cmake --build --preset coverage
+    - ctest --preset coverage
+    - cd build-coverage
+    - gcovr --root .. --filter '../src/' --txt --cobertura coverage.xml
+  # Coverage is reported but does not gate the build. The README explains why.
+  coverage: '/^TOTAL.*\s(\d+\.?\d*)\%/'
+  artifacts:
+    when: always
+    expire_in: 1 week
+    reports:
+      coverage_report:
+        coverage_format: cobertura
+        path: build-coverage/coverage.xml
+
+# SBOM and dependency CVE scan. Needs no build, so it starts immediately. The
+# scheduled run catches CVEs published against code that has not changed.
+cve-scan:
+  stage: analyze
+  needs: []
+  script:
+    - ./tools/gen-sbom.py --demo-bug "$DEMO_BUG" -o sbom.cdx.json
+    - grype sbom:sbom.cdx.json --fail-on high
+  artifacts:
+    when: always
+    expire_in: 1 week
+    paths:
+      - sbom.cdx.json
+    reports:
+      cyclonedx:
+        - sbom.cdx.json
+
+# ---------------------------------------------------------------------------
+# Stage 4: fuzzing. 60 seconds on merge requests and pushes, 30 minutes on a
+# schedule. Create the schedule under Build > Pipeline schedules. A
+# FUZZ_SECONDS variable set on the schedule overrides the 1800 below.
+# ---------------------------------------------------------------------------
+fuzz:
+  stage: fuzz
+  needs: [warnings]
+  timeout: 45 minutes
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+      variables:
+        FUZZ_SECONDS: "1800"
+    - when: on_success
+  script:
+    - cmake --preset fuzz -DDEMO_BUG=$DEMO_BUG
+    - cmake --build --preset fuzz
+    - mkdir -p fuzz-artifacts
+    - |
+      ./build-fuzz/fuzz/fuzz_frame_parser fuzz/corpus \
+        -artifact_prefix=fuzz-artifacts/ \
+        -max_total_time=$FUZZ_SECONDS -print_final_stats=1
+  artifacts:
+    when: on_failure
+    expire_in: 1 month
+    paths:
+      - fuzz-artifacts/
+
+# ---------------------------------------------------------------------------
+# Stage 5: seeded defect checks. Each seeded defect must be caught by exactly
+# the stages listed in the README table, and the clean build (0) must pass
+# every stage of tools/check.sh. This confirms that each stage still detects
+# the defects it is expected to detect.
+# ---------------------------------------------------------------------------
+seeded-defects:
+  stage: verify-gate
+  needs: [cppcheck, clang-tidy, gcc-analyzer, cve-scan, unit-tests, sanitizers, fuzz]
+  parallel:
+    matrix:
+      - BUG: ["0", "1", "2", "3", "4", "5"]
+  script:
+    - FUZZ_SECONDS=60 ./tools/verify-seeded-defect.sh $BUG
+  artifacts:
+    when: on_failure
+    expire_in: 1 week
+    paths:
+      - build-check/

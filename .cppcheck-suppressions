@@ -1,0 +1,13 @@
+// Keep this list short, and give each entry a reason.
+missingIncludeSystem
+// Library entry points are called by the application, not by this repo.
+unusedFunction
+// Same reason. Newer cppcheck (2.17 does, 2.13 does not) asks for static
+// linkage on public functions, because it scans src/ and never sees the
+// header and test callers.
+staticFunction
+// cppcheck 2.x emits an informational nag about premium checkers.
+checkersReport
+// The list has to work across cppcheck versions, and an ID one version does
+// not know (staticFunction, on 2.13) is otherwise reported as unmatched.
+unmatchedSuppression

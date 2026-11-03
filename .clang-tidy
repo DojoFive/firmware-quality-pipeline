@@ -1,0 +1,47 @@
+---
+# SPDX-License-Identifier: Apache-2.0
+#
+# These check groups all apply to plain C. clang-analyzer-* does
+# path-sensitive analysis, which cppcheck does less of, so the gate runs both
+# tools.
+#
+# Disabled checks and why:
+#   readability-magic-numbers ......... protocol constants are the domain
+#   readability-identifier-length ..... i, rb and crc are fine
+#   readability-uppercase-literal-suffix  house style uses lowercase u
+#   readability-isolate-declaration ... style preference, does not find bugs
+#   readability-braces-around-statements  -Wmisleading-indentation and
+#       clang-format already cover the bug this check exists to prevent
+#   readability-function-cognitive-complexity  a complexity metric; review
+#       it in code review instead of gating on it
+#   bugprone-easily-swappable-parameters  unavoidable in (ptr, len) APIs
+#   cert-dcl37-c ...................... flags every header guard and
+#       *_t typedef here as a reserved identifier
+#   cert-dcl51-cpp .................... C++ alias of cert-dcl37-c
+#   misc-include-cleaner .............. too noisy against layered HALs
+#   clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling
+#       Annex K (memcpy_s and friends) is optional in C11 and absent from
+#       nearly every embedded libc, so every report from it is a false
+#       positive here.
+Checks: >
+  clang-analyzer-*,
+  bugprone-*,
+  cert-*,
+  misc-*,
+  performance-*,
+  readability-*,
+  -readability-identifier-length,
+  -readability-magic-numbers,
+  -readability-isolate-declaration,
+  -readability-braces-around-statements,
+  -readability-function-cognitive-complexity,
+  -readability-uppercase-literal-suffix,
+  -bugprone-easily-swappable-parameters,
+  -cert-dcl37-c,
+  -cert-dcl51-cpp,
+  -misc-include-cleaner,
+  -clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling
+
+WarningsAsErrors: '*'
+HeaderFilterRegex: '.*/(include|src)/.*\.h$'
+FormatStyle: file

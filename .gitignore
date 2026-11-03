@@ -1,0 +1,12 @@
+build/
+build-*/
+*.gcda
+*.gcno
+*.gcov
+coverage/
+crash-*
+leak-*
+timeout-*
+oom-*
+compile_commands.json
+.cache/

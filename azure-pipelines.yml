@@ -1,0 +1,262 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# Azure DevOps Pipelines definition for the quality gate.
+#
+# Every job runs tools/install-deps.sh and then the same CMake presets that
+# tools/check.sh uses locally, so CI and local runs apply the same checks.
+#
+# The nightly fuzz run needs a scheduled trigger. The schedules block below
+# only applies if the pipeline's UI setting "Override YAML schedules" is off.
+#
+# The pr block only applies to repos hosted on GitHub or Bitbucket. For Azure
+# Repos Git, add a build validation branch policy instead.
+
+trigger:
+  branches:
+    include:
+      - main
+
+pr:
+  branches:
+    include:
+      - '*'
+
+schedules:
+  - cron: '0 6 * * *'
+    displayName: nightly long fuzz
+    branches:
+      include:
+        - main
+    always: true
+
+variables:
+  DEMO_BUG: '0'
+  FUZZ_SECONDS: '60'
+
+pool:
+  vmImage: 'ubuntu-24.04'
+
+stages:
+  # -------------------------------------------------------------------------
+  # Compiler warnings as errors. Every other job depends on a clean build, so
+  # this one runs first.
+  # -------------------------------------------------------------------------
+  - stage: Build
+    displayName: Compiler warnings as errors
+    jobs:
+      - job: warnings
+        steps:
+          - script: ./tools/install-deps.sh
+            displayName: Install toolchain
+          - script: |
+              set -e
+              cmake --preset default -DDEMO_BUG=$(DEMO_BUG)
+              cmake --build --preset default
+            displayName: Build with -Werror
+          - publish: build/compile_commands.json
+            artifact: compile-commands
+            displayName: Publish compile database
+
+  # -------------------------------------------------------------------------
+  # Three static analyzers in parallel. Each one finds bugs the others miss.
+  # -------------------------------------------------------------------------
+  - stage: StaticAnalysis
+    displayName: Static analysis
+    dependsOn: Build
+    jobs:
+      - job: analyzers
+        strategy:
+          matrix:
+            cppcheck:
+              TOOL: 'cppcheck'
+            clang_tidy:
+              TOOL: 'clang-tidy'
+            gcc_analyzer:
+              TOOL: 'gcc-analyzer'
+        steps:
+          - script: ./tools/install-deps.sh
+            displayName: Install toolchain
+
+          - script: |
+              set -e
+              cppcheck --enable=all --inline-suppr --std=c11 --error-exitcode=2 \
+                --suppressions-list=.cppcheck-suppressions \
+                --xml --output-file=$(Build.ArtifactStagingDirectory)/cppcheck.xml \
+                -Iinclude -DDEMO_BUG=$(DEMO_BUG) src/
+            displayName: cppcheck
+            condition: eq(variables['TOOL'], 'cppcheck')
+
+          - script: |
+              set -e
+              cmake --preset tidy -DDEMO_BUG=$(DEMO_BUG)
+              cmake --build --preset tidy
+            displayName: clang-tidy
+            condition: eq(variables['TOOL'], 'clang-tidy')
+
+          - script: |
+              set -e
+              cmake --preset analyzer -DDEMO_BUG=$(DEMO_BUG)
+              cmake --build --preset analyzer
+            displayName: gcc -fanalyzer
+            condition: eq(variables['TOOL'], 'gcc-analyzer')
+
+          - publish: $(Build.ArtifactStagingDirectory)
+            artifact: static-analysis-$(TOOL)
+            condition: and(always(), eq(variables['TOOL'], 'cppcheck'))
+
+  # -------------------------------------------------------------------------
+  # Unit tests, plus the same tests under sanitizers. A sanitizer build
+  # changes timing and code generation, so the uninstrumented run shows
+  # whether a failure is a logic bug or a sanitizer finding.
+  # -------------------------------------------------------------------------
+  - stage: Test
+    displayName: Tests and dynamic analysis
+    dependsOn: Build
+    jobs:
+      - job: unit_tests
+        displayName: Unit tests
+        steps:
+          - script: ./tools/install-deps.sh
+            displayName: Install toolchain
+          - script: |
+              set -e
+              cmake --preset default -DDEMO_BUG=$(DEMO_BUG)
+              cmake --build --preset default
+              ctest --preset default --output-junit test-results.xml
+            displayName: ctest
+          - task: PublishTestResults@2
+            condition: always()
+            inputs:
+              testResultsFormat: 'JUnit'
+              testResultsFiles: 'build/test-results.xml'
+              testRunTitle: 'Unit tests'
+
+      - job: sanitizers
+        displayName: ASan and UBSan
+        steps:
+          - script: ./tools/install-deps.sh
+            displayName: Install toolchain
+          - script: |
+              set -e
+              cmake --preset sanitize -DDEMO_BUG=$(DEMO_BUG)
+              cmake --build --preset sanitize
+              # UBSAN_OPTIONS and ASAN_OPTIONS come from the sanitize test preset.
+              ctest --preset sanitize --output-junit test-results.xml
+            displayName: Sanitized test run
+          - task: PublishTestResults@2
+            condition: always()
+            inputs:
+              testResultsFormat: 'JUnit'
+              testResultsFiles: 'build-sanitize/test-results.xml'
+              testRunTitle: 'Sanitized tests'
+
+      - job: coverage
+        displayName: Coverage
+        steps:
+          - script: ./tools/install-deps.sh
+            displayName: Install toolchain
+          - script: |
+              set -e
+              cmake --preset coverage -DDEMO_BUG=$(DEMO_BUG)
+              cmake --build --preset coverage
+              ctest --preset coverage
+              cd build-coverage
+              gcovr --root .. --filter '../src/' --txt --cobertura coverage.xml --html-details coverage.html
+            displayName: Run tests with coverage
+          # Coverage is reported but does not gate the build. The README explains why.
+          - task: PublishCodeCoverageResults@2
+            condition: always()
+            inputs:
+              summaryFileLocation: 'build-coverage/coverage.xml'
+              pathToSources: 'src'
+
+  # -------------------------------------------------------------------------
+  # SBOM and dependency CVE scan. Needs no build, so it starts immediately.
+  # The nightly run catches CVEs published against code that has not changed.
+  # -------------------------------------------------------------------------
+  - stage: SupplyChain
+    displayName: SBOM and CVE scan
+    dependsOn: []
+    jobs:
+      - job: cve_scan
+        steps:
+          - script: ./tools/install-deps.sh
+            displayName: Install toolchain
+          - script: ./tools/gen-sbom.py --demo-bug "$(DEMO_BUG)" -o $(Build.ArtifactStagingDirectory)/sbom.cdx.json
+            displayName: Generate SBOM
+          - script: grype sbom:$(Build.ArtifactStagingDirectory)/sbom.cdx.json --fail-on high
+            displayName: Scan for high and critical CVEs
+          - publish: $(Build.ArtifactStagingDirectory)/sbom.cdx.json
+            artifact: sbom
+            condition: always()
+            displayName: Publish SBOM
+
+  # -------------------------------------------------------------------------
+  # Fuzzing. Short on pull requests, long on the nightly schedule.
+  # -------------------------------------------------------------------------
+  - stage: Fuzz
+    displayName: Fuzzing
+    dependsOn: Build
+    jobs:
+      - job: fuzz
+        timeoutInMinutes: 45
+        steps:
+          - script: ./tools/install-deps.sh
+            displayName: Install toolchain
+          - script: |
+              set -e
+              cmake --preset fuzz -DDEMO_BUG=$(DEMO_BUG)
+              cmake --build --preset fuzz
+            displayName: Build fuzz target
+          - script: |
+              set -e
+              DURATION=$(FUZZ_SECONDS)
+              if [ "$(Build.Reason)" = "Schedule" ]; then DURATION=1800; fi
+              mkdir -p $(Build.ArtifactStagingDirectory)/fuzz-artifacts
+              ./build-fuzz/fuzz/fuzz_frame_parser fuzz/corpus \
+                -artifact_prefix=$(Build.ArtifactStagingDirectory)/fuzz-artifacts/ \
+                -max_total_time="$DURATION" -print_final_stats=1
+            displayName: Run fuzzer
+          - publish: $(Build.ArtifactStagingDirectory)/fuzz-artifacts
+            artifact: fuzz-crashers
+            condition: failed()
+            displayName: Publish crashing inputs
+
+  # -------------------------------------------------------------------------
+  # Seeded defect checks. Each seeded defect must be caught by exactly the
+  # stages listed in the README table, and the clean build (0) must pass every
+  # stage of tools/check.sh. This confirms that each stage still detects the
+  # defects it is expected to detect.
+  # -------------------------------------------------------------------------
+  - stage: VerifyGate
+    displayName: Seeded defect verification
+    dependsOn:
+      - StaticAnalysis
+      - SupplyChain
+      - Test
+      - Fuzz
+    jobs:
+      - job: seeded_defects
+        strategy:
+          matrix:
+            clean:
+              BUG: '0'
+            defect_1:
+              BUG: '1'
+            defect_2:
+              BUG: '2'
+            defect_3:
+              BUG: '3'
+            defect_4:
+              BUG: '4'
+            defect_5:
+              BUG: '5'
+        steps:
+          - script: ./tools/install-deps.sh
+            displayName: Install toolchain
+          - script: FUZZ_SECONDS=60 ./tools/verify-seeded-defect.sh $(BUG)
+            displayName: Check which stages catch the defect
+          - publish: build-check
+            artifact: check-logs-defect-$(BUG)
+            condition: failed()
+            displayName: Publish check logs

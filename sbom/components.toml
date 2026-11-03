@@ -1,0 +1,48 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# Every third-party component in this repo. tools/gen-sbom.py turns this file
+# into a CycloneDX SBOM, and grype checks that SBOM for known CVEs.
+#
+# Firmware dependencies are usually vendored source with no package manifest,
+# so SBOM tools cannot discover them. List each one here by hand.
+#
+# Fields:
+#   name, version, supplier, license   required
+#   cpe       required. grype matches C libraries by CPE; a PURL alone finds
+#             nothing. Look up the vendor and product names at
+#             https://nvd.nist.gov/products/cpe/search
+#   purl      optional
+#   scope     "required" (ships in the firmware image, the default) or
+#             "excluded" (build or test only)
+#   fetchcontent  optional. Name of a FetchContent_Declare in this repo. The
+#             version must match its GIT_TAG, so the SBOM cannot drift from
+#             what the build downloads.
+#   demo_bug  optional. Only include the component when DEMO_BUG is set to
+#             this value.
+
+[firmware]
+name     = "firmware-quality-pipeline"
+supplier = "Dojo Five"
+license  = "Apache-2.0"
+
+[[component]]
+name         = "googletest"
+version      = "1.14.0"
+supplier     = "Google"
+license      = "BSD-3-Clause"
+cpe          = "cpe:2.3:a:google:googletest:1.14.0:*:*:*:*:*:*:*"
+purl         = "pkg:github/google/googletest@v1.14.0"
+scope        = "excluded"
+fetchcontent = "googletest"
+
+# Seeded defect 5: a dependency with known critical CVEs. mbedTLS 2.16.0 has,
+# among others, CVE-2021-44732 (double free, critical, fixed in 2.16.12). It
+# is only listed when DEMO_BUG=5, and no mbedTLS code is in this repo.
+[[component]]
+name     = "mbedtls"
+version  = "2.16.0"
+supplier = "Arm"
+license  = "Apache-2.0"
+cpe      = "cpe:2.3:a:arm:mbed_tls:2.16.0:*:*:*:*:*:*:*"
+purl     = "pkg:github/Mbed-TLS/mbedtls@mbedtls-2.16.0"
+demo_bug = 5

@@ -1,0 +1,16 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# grype reads this file from the working directory. tools/check.sh and every
+# CI job run grype from the repo root.
+check-for-app-update: false
+
+# Accepted findings. Add a CVE here only with a comment explaining why it does
+# not affect this firmware, for example because the vulnerable code is not
+# compiled in. Keep the list short, the same as .cppcheck-suppressions.
+#
+#   - vulnerability: CVE-2021-44732
+#     package:
+#       name: mbedtls
+#       version: 2.16.0
+#     # Not affected: the SSL module is disabled in mbedtls_config.h.
+ignore: []

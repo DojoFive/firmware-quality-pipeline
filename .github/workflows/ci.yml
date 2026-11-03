@@ -1,0 +1,217 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# GitHub Actions definition for the quality gate.
+#
+# Every job runs tools/install-deps.sh and then the same CMake presets that
+# tools/check.sh uses locally, so CI and local runs apply the same checks.
+name: quality gate
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    # Nightly run, which gives the fuzz job 30 minutes instead of 60 seconds.
+    - cron: '0 6 * * *'
+
+# Superseded pull request runs are canceled. Pushes to main and the nightly
+# run get their own groups, so a merge does not cancel a 30 minute fuzz run.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+env:
+  DEMO_BUG: '0'
+
+jobs:
+  # -------------------------------------------------------------------------
+  # Compiler warnings as errors. Every other job depends on a clean build, so
+  # this one runs first.
+  # -------------------------------------------------------------------------
+  warnings:
+    name: compiler warnings as errors
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - run: ./tools/install-deps.sh
+      - run: cmake --preset default -DDEMO_BUG=$DEMO_BUG
+      - run: cmake --build --preset default
+      - uses: actions/upload-artifact@v7
+        with:
+          name: compile-commands
+          path: build/compile_commands.json
+
+  # -------------------------------------------------------------------------
+  # Three static analyzers in parallel. Each one finds bugs the others miss.
+  # -------------------------------------------------------------------------
+  static-analysis:
+    name: ${{ matrix.tool }}
+    runs-on: ubuntu-24.04
+    needs: warnings
+    strategy:
+      fail-fast: false
+      matrix:
+        tool: [cppcheck, clang-tidy, gcc-analyzer]
+    steps:
+      - uses: actions/checkout@v7
+      - run: ./tools/install-deps.sh
+
+      - name: cppcheck
+        if: matrix.tool == 'cppcheck'
+        run: |
+          cppcheck --enable=all --inline-suppr --std=c11 --error-exitcode=2 \
+            --suppressions-list=.cppcheck-suppressions \
+            --xml --output-file=cppcheck.xml \
+            -Iinclude -DDEMO_BUG=$DEMO_BUG src/
+
+      - name: clang-tidy
+        if: matrix.tool == 'clang-tidy'
+        run: |
+          cmake --preset tidy -DDEMO_BUG=$DEMO_BUG
+          cmake --build --preset tidy
+
+      - name: gcc -fanalyzer
+        if: matrix.tool == 'gcc-analyzer'
+        run: |
+          cmake --preset analyzer -DDEMO_BUG=$DEMO_BUG
+          cmake --build --preset analyzer
+
+      - uses: actions/upload-artifact@v7
+        if: always() && matrix.tool == 'cppcheck'
+        with:
+          name: cppcheck-report
+          path: cppcheck.xml
+          if-no-files-found: ignore
+
+  # -------------------------------------------------------------------------
+  # Unit tests, plus the same tests under sanitizers. A sanitizer build
+  # changes timing and code generation, so the uninstrumented run shows
+  # whether a failure is a logic bug or a sanitizer finding.
+  # -------------------------------------------------------------------------
+  tests:
+    name: unit tests
+    runs-on: ubuntu-24.04
+    needs: warnings
+    steps:
+      - uses: actions/checkout@v7
+      - run: ./tools/install-deps.sh
+      - run: cmake --preset default -DDEMO_BUG=$DEMO_BUG
+      - run: cmake --build --preset default
+      - run: ctest --preset default --output-junit test-results.xml
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: unit-test-results
+          path: build/test-results.xml
+
+  sanitizers:
+    name: ASan + UBSan
+    runs-on: ubuntu-24.04
+    needs: warnings
+    steps:
+      - uses: actions/checkout@v7
+      - run: ./tools/install-deps.sh
+      - run: cmake --preset sanitize -DDEMO_BUG=$DEMO_BUG
+      - run: cmake --build --preset sanitize
+      # UBSAN_OPTIONS and ASAN_OPTIONS come from the sanitize test preset.
+      - run: ctest --preset sanitize --output-junit test-results.xml
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: sanitizer-test-results
+          path: build-sanitize/test-results.xml
+
+  coverage:
+    name: coverage
+    runs-on: ubuntu-24.04
+    needs: warnings
+    steps:
+      - uses: actions/checkout@v7
+      - run: ./tools/install-deps.sh
+      - run: cmake --preset coverage -DDEMO_BUG=$DEMO_BUG
+      - run: cmake --build --preset coverage
+      - run: ctest --preset coverage
+      # Coverage is reported but does not gate the build. The README explains why.
+      - name: report
+        working-directory: build-coverage
+        run: |
+          gcovr --root .. --filter '../src/' --txt --cobertura coverage.xml
+          gcovr --root .. --filter '../src/' --html-details coverage.html
+      - uses: actions/upload-artifact@v7
+        with:
+          name: coverage-report
+          path: build-coverage/coverage.*
+
+  # -------------------------------------------------------------------------
+  # SBOM and dependency CVE scan. Needs no build, so it starts immediately.
+  # The nightly run catches CVEs published against code that has not changed.
+  # -------------------------------------------------------------------------
+  cve-scan:
+    name: SBOM + CVE scan
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - run: ./tools/install-deps.sh
+      - run: ./tools/gen-sbom.py --demo-bug "$DEMO_BUG" -o sbom.cdx.json
+      - run: grype sbom:sbom.cdx.json --fail-on high
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: sbom
+          path: sbom.cdx.json
+
+  # -------------------------------------------------------------------------
+  # Fuzzing. Short on pull requests, long on the nightly schedule.
+  # -------------------------------------------------------------------------
+  fuzz:
+    name: fuzz
+    runs-on: ubuntu-24.04
+    needs: warnings
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+      - run: ./tools/install-deps.sh
+      - run: cmake --preset fuzz -DDEMO_BUG=$DEMO_BUG
+      - run: cmake --build --preset fuzz
+      - name: run
+        run: |
+          DURATION=60
+          if [ "${{ github.event_name }}" = "schedule" ]; then DURATION=1800; fi
+          mkdir -p fuzz-artifacts
+          ./build-fuzz/fuzz/fuzz_frame_parser fuzz/corpus \
+            -artifact_prefix=fuzz-artifacts/ \
+            -max_total_time="$DURATION" -print_final_stats=1
+      - uses: actions/upload-artifact@v7
+        if: failure()
+        with:
+          name: fuzz-crashers
+          path: fuzz-artifacts/
+          if-no-files-found: ignore
+
+  # -------------------------------------------------------------------------
+  # Seeded defect checks. Each seeded defect must be caught by exactly the
+  # stages listed in the README table, and the clean build (0) must pass every
+  # stage of tools/check.sh. This confirms that each stage still detects the
+  # defects it is expected to detect.
+  # -------------------------------------------------------------------------
+  seeded-defects:
+    name: seeded defect ${{ matrix.bug }}
+    runs-on: ubuntu-24.04
+    needs: [static-analysis, cve-scan, tests, sanitizers, fuzz]
+    strategy:
+      fail-fast: false
+      matrix:
+        bug: [0, 1, 2, 3, 4, 5]
+    steps:
+      - uses: actions/checkout@v7
+      - run: ./tools/install-deps.sh
+      - run: FUZZ_SECONDS=60 ./tools/verify-seeded-defect.sh ${{ matrix.bug }}
+      - uses: actions/upload-artifact@v7
+        if: failure()
+        with:
+          name: check-logs-defect-${{ matrix.bug }}
+          path: build-check/
